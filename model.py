@@ -58,6 +58,28 @@ class MistralMLP(nn.Module):
         return down_proj
 
 
+def rotate_half(x):
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+
 class MistralAttention(nn.Module):
     def __init__(self, config: MistralConfig, layer_idx: int):
         super().__init__()
@@ -73,9 +95,39 @@ class MistralAttention(nn.Module):
         self.v_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=False)
 
-    def forward(self):
-        pass
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
 
+        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        # Repeat KV heads to match query heads (GQA)
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        # Attention
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.scaling
+        if attention_mask is not None:
+            attn_weights = attn_weights + attention_mask
+
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_output = torch.matmul(attn_weights, value_states)
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(*input_shape, -1)
+        attn_output = self.o_proj(attn_output)
+
+        return attn_output
 
 
 class MistralRMSNorm(nn.Module):
@@ -85,7 +137,11 @@ class MistralRMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, hidden_states):
-        pass
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
 
 
 class MistralDecoderLayer(nn.Module):
@@ -97,8 +153,27 @@ class MistralDecoderLayer(nn.Module):
         self.input_layernorm = MistralRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = MistralRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def forward(self):
-        pass
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.self_attn(
+            hidden_states=hidden_states,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+        )
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+
+        return hidden_states
 
 
 
@@ -137,7 +212,15 @@ class MistralRotaryEmbedding(nn.Module):
 
 
     def forward(self, x, position_ids):
-        pass
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
+        position_ids_expanded = position_ids[:, None, :].float()
+
+        freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        cos = emb.cos() * self.attention_scaling
+        sin = emb.sin() * self.attention_scaling
+
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
 class MistralModel(nn.Module):
@@ -153,8 +236,35 @@ class MistralModel(nn.Module):
         self.rotary_emb = MistralRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
 
-    def forward(self):
-        pass
+    def forward(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        hidden_states = self.embed_tokens(input_ids)
+
+        # Create causal mask
+        seq_len = input_ids.shape[1]
+        causal_mask = torch.triu(
+            torch.full((seq_len, seq_len), float("-inf"), device=input_ids.device, dtype=hidden_states.dtype),
+            diagonal=1
+        )
+        if attention_mask is not None:
+            causal_mask = causal_mask + attention_mask
+
+        # Position IDs and embeddings
+        position_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0)
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+        for decoder_layer in self.layers:
+            hidden_states = decoder_layer(
+                hidden_states,
+                position_embeddings=position_embeddings,
+                attention_mask=causal_mask,
+            )
+
+        hidden_states = self.norm(hidden_states)
+        return hidden_states
 
 
 class MistralForCausalLM(nn.Module):
@@ -163,6 +273,14 @@ class MistralForCausalLM(nn.Module):
         self.config, self.model = config, MistralModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
+    def forward(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        hidden_states = self.model(input_ids, attention_mask=attention_mask)
+        logits = self.lm_head(hidden_states)
+        return logits
 
     @classmethod
     def from_pretrained(cls, path: str, config: MistralConfig, device, dtype):
@@ -186,8 +304,12 @@ class MistralForCausalLM(nn.Module):
             
             for name, param in module.named_parameters(recurse=False):
                 full_name = f"{prefix}{name}"
-                if full_name in weights: module._parameters[name] = nn.Parameter(weights[full_name], requires_grad=False)
-                elif param.device.type == 'meta': module._parameters[name] = nn.Parameter(torch.empty(param.shape, device=device, dtype=dtype).normal_(std=0.02), requires_grad=False)
+                if full_name in weights: 
+                    module._parameters[name] = nn.Parameter(weights[full_name], requires_grad=False)
+                    #print(f"Loaded {full_name} with shape {weights[full_name].shape}")
+                elif param.device.type == 'meta': 
+                    module._parameters[name] = nn.Parameter(torch.empty(param.shape, device=device, dtype=dtype).normal_(std=0.02), requires_grad=False)
+                    #print(f"Initialized {full_name} with shape {param.shape}")
             
         materialize(model)
         del weights; gc.collect(); torch.cuda.empty_cache()
