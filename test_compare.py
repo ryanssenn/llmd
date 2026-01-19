@@ -29,7 +29,7 @@ def load_tokenizer():
     return AutoTokenizer.from_pretrained("models/Ministral-3b-instruct")
 
 
-def test_logits(prompt="Hello"):
+def test_logits(prompt):
     tokenizer = load_tokenizer()
 
     print("Loading HF model...")
@@ -73,4 +73,4 @@ def test_logits(prompt="Hello"):
 
 
 if __name__ == "__main__":
-    test_logits("Hello")
+    test_logits("Hello, how are you doing today?")
