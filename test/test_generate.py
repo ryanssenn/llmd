@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Test script for LLM inference with multiple prompts."""
 import sys
 sys.path.insert(0, "..")
 

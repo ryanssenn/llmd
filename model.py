@@ -86,6 +86,7 @@ class MistralAttention(nn.Module):
         self.config = config
         self.layer_idx = layer_idx
         self.head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
@@ -95,11 +96,17 @@ class MistralAttention(nn.Module):
         self.v_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=False)
 
+        # KV cache - allocated externally by LLM engine
+        self.k_cache: torch.Tensor | None = None
+        self.v_cache: torch.Tensor | None = None
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None = None,
+        slot_idx: int | None = None,
+        cache_position: int = 0,
     ) -> torch.Tensor:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
@@ -110,6 +117,15 @@ class MistralAttention(nn.Module):
 
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        seq_len = hidden_states.shape[1]
+
+        # Use KV cache if available
+        if self.k_cache is not None and slot_idx is not None:
+            self.k_cache[slot_idx, :, cache_position:cache_position + seq_len, :] = key_states.squeeze(0)
+            self.v_cache[slot_idx, :, cache_position:cache_position + seq_len, :] = value_states.squeeze(0)
+            key_states = self.k_cache[slot_idx:slot_idx + 1, :, :cache_position + seq_len, :]
+            value_states = self.v_cache[slot_idx:slot_idx + 1, :, :cache_position + seq_len, :]
 
         # Repeat KV heads to match query heads (GQA)
         key_states = repeat_kv(key_states, self.num_key_value_groups)
@@ -158,6 +174,8 @@ class MistralDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None = None,
+        slot_idx: int | None = None,
+        cache_position: int = 0,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -165,6 +183,8 @@ class MistralDecoderLayer(nn.Module):
             hidden_states=hidden_states,
             position_embeddings=position_embeddings,
             attention_mask=attention_mask,
+            slot_idx=slot_idx,
+            cache_position=cache_position,
         )
         hidden_states = residual + hidden_states
 
@@ -224,20 +244,24 @@ class MistralModel(nn.Module):
         self,
         input_ids: torch.LongTensor,
         attention_mask: torch.Tensor | None = None,
+        slot_idx: int | None = None,
+        cache_position: int = 0,
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
 
-        # Create causal mask
         seq_len = input_ids.shape[1]
+        total_len = cache_position + seq_len
+
+        # Create causal mask (query attends to all cached + current tokens)
         causal_mask = torch.triu(
-            torch.full((seq_len, seq_len), float("-inf"), device=input_ids.device, dtype=hidden_states.dtype),
-            diagonal=1
+            torch.full((seq_len, total_len), float("-inf"), device=input_ids.device, dtype=hidden_states.dtype),
+            diagonal=cache_position + 1
         )
         if attention_mask is not None:
             causal_mask = causal_mask + attention_mask
 
-        # Position IDs and embeddings
-        position_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0)
+        # Position IDs and embeddings (offset by cache_position)
+        position_ids = torch.arange(cache_position, total_len, device=input_ids.device).unsqueeze(0)
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         for decoder_layer in self.layers:
@@ -245,6 +269,8 @@ class MistralModel(nn.Module):
                 hidden_states,
                 position_embeddings=position_embeddings,
                 attention_mask=causal_mask,
+                slot_idx=slot_idx,
+                cache_position=cache_position,
             )
 
         hidden_states = self.norm(hidden_states)
@@ -261,8 +287,10 @@ class MistralForCausalLM(nn.Module):
         self,
         input_ids: torch.LongTensor,
         attention_mask: torch.Tensor | None = None,
+        slot_idx: int | None = None,
+        cache_position: int = 0,
     ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, attention_mask=attention_mask)
+        hidden_states = self.model(input_ids, attention_mask=attention_mask, slot_idx=slot_idx, cache_position=cache_position)
         logits = self.lm_head(hidden_states)
         return logits
 

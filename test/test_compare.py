@@ -1,11 +1,16 @@
+import sys
+sys.path.insert(0, "..")
+
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from model import MistralConfig, MistralForCausalLM
 
 
+model_path = "../models/Ministral-3b-instruct"
+
 def load_hf_model():
     model = AutoModelForCausalLM.from_pretrained(
-        "models/Ministral-3b-instruct",
+        model_path,
         torch_dtype=torch.float16,
         device_map="cpu"
     )
@@ -14,9 +19,9 @@ def load_hf_model():
 
 
 def load_our_model():
-    config = MistralConfig.from_json("models/Ministral-3b-instruct/config.json")
+    config = MistralConfig.from_json("../models/Ministral-3b-instruct/config.json")
     model = MistralForCausalLM.from_pretrained(
-        "models/Ministral-3b-instruct/",
+        model_path,
         config=config,
         device="cpu",
         dtype=torch.float16,
@@ -26,7 +31,7 @@ def load_our_model():
 
 
 def load_tokenizer():
-    return AutoTokenizer.from_pretrained("models/Ministral-3b-instruct")
+    return AutoTokenizer.from_pretrained(model_path)
 
 
 def test_logits(prompt):
