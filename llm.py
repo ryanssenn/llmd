@@ -59,7 +59,9 @@ class LLM:
             self._loop_thread.start()
 
         future = concurrent.futures.Future()
-        token_ids = self.tokenizer.encode(prompt)
+        messages = [{"role": "user", "content": prompt}]
+        formatted = self.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+        token_ids = self.tokenizer.encode(formatted)
         request = Request(token_ids=token_ids, max_tokens=max_tokens, temperature=temperature, future=future)
         self._request_queue.put(request)
         return future
